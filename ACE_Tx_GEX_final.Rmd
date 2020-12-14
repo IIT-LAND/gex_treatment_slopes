@@ -1,0 +1,733 @@
+---
+title: "Predicting Treatment Slopes with Pre-Treatment Clinical and Gene Expression Data"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Load libraries and custom code
+
+Here we will load all the R libraries necessary and all the custom code as well (e.g., functions for running the LASSO models, making spaghetti plots, etc)
+
+```{r, warning=FALSE, message=FALSE}
+# load libraries and other custom code
+easypackages::libraries("readxl","ggplot2","patchwork",
+                        "here","limma","reshape2","glmnet",
+                        "genefilter","Biobase","psych","nlme")
+source(here("code","lasso_functions.R"))
+source(here("code","spaghettiPlot.R"))
+source("/Users/mlombardo/Dropbox/R/get_ggColorHue.R")
+
+# number of permutations to set for all the permutation tests run down below
+nperm = 1000
+
+fontSize = 5
+```
+
+# Load treatment data
+
+Load in excel files that contain the longitudinal treatment measure (aSLP).
+
+```{r, warning=FALSE, message=FALSE}
+# Read in melted treatment data
+txplotpath = here("plots")
+
+txfile = here("data","melted_tx_data.xlsx")
+melted_tx_data = read_excel(txfile)
+
+melted_tx_data_orig = melted_tx_data
+
+txfile = here("data","tx_data.xlsx")
+tx_data = read_excel(txfile)
+tx_data = as.data.frame(tx_data)
+rownames(tx_data) = tx_data$subjectId
+
+data2use = data.frame(melted_tx_data)
+data2use$subgrp = factor(data2use$subgrp, exclude = "NA")
+
+# run statistical model
+y_var = "value"
+x_var = "age"
+fx_form = as.formula(sprintf("%s ~ 1", y_var, x_var))
+rx_form = as.formula(sprintf("~ %s|subjectId",x_var))
+
+ctrl <- lmeControl(opt='optim', msMaxIter = 500)
+ml_method = "REML"
+mod2use = eval(substitute(lme(fixed = fx_form, random = rx_form, data = data2use,
+                                 na.action = na.omit, control=ctrl, method = ml_method),
+                             list(fx_form = fx_form, rx_form = rx_form)))
+mod2 = mod2use
+summary(mod2)
+# grab subject-specific intercepts and slopes
+sub_spec_int_slopes2 = coef(mod2use)
+sub_spec_int_slopes2$subjectId = factor(rownames(sub_spec_int_slopes2))
+colnames(sub_spec_int_slopes2)[c(1,2)] = c("rfx_intercept","rfx_slope")
+
+# merge subject-specific intercepts and slopes with treatment data
+tx_data = merge(x = tx_data, y = sub_spec_int_slopes2[,c("subjectId","rfx_intercept","rfx_slope")], by.x = "subjectId", by.y = "subjectId")
+```
+
+# Load gene expression data
+
+Here we load in the superset of all microarray gene expression data, and then do some cleaning up of things so that we are left with a final subset of subjects in this treatment dataset.
+
+```{r, warning=FALSE, message=FALSE}
+# load superset of gene expression data
+load("~/Dropbox/data/ucsd_ace_microarray_data/dataQuantile.rda")
+
+# grab pheno data
+pheno_data = pData(dataQuantile)
+# grab expression data
+exprData = exprs(dataQuantile)
+# grab meta data for genes
+meta_data = fData(dataQuantile)
+
+# subjectId for subset of treatment subjects
+subids2use = tx_data$subjectId
+
+# grab pheno data for subset of subjects with expression data
+pheno_data_sub = subset(pheno_data,is.element(pheno_data$subjectId,subids2use))
+pheno_data_sub$exprColName = rownames(pheno_data_sub)
+# find duplicates OR subjects with GEX data older than TX Intake age and remove them
+duplicates2remove = c("4807258001_B","4807258003_C","4807258003_A",
+                      "4807135001_F","4807135021_B","4807135022_E",
+                      "4807135045_E","4807135042_E","4807135042_F","107","243","187","359","272",
+                      "319","228","339","133","200")
+
+mask = is.element(pheno_data_sub$exprColName,duplicates2remove)
+pheno_data_sub = pheno_data_sub[!mask,]
+
+# tidy up the pheno_data_sub data frame
+colnames(pheno_data_sub)[colnames(pheno_data_sub)=="age"] = "gex_age"
+pheno_data_sub$sex = factor(pheno_data_sub$sex)
+pheno_data_sub$batch = factor(pheno_data_sub$batch)
+pheno_data_sub$diagnosis_binary = factor(pheno_data_sub$diagnosis_binary)
+pheno_data_sub$subjectId = factor(pheno_data_sub$subjectId)
+pheno_data_sub$blooddrawid = factor(pheno_data_sub$blooddrawid)
+pheno_data_sub$exprColName = factor(pheno_data_sub$exprColName)
+
+# find RIN for subs in pheno_data_sub
+rin_data = read_excel("/Users/mlombardo/Dropbox/data/ucsd_ace_microarray_data/pData_HT12_WG6_processedv2.xlsx",na = "NA")
+rin_data_sub = as.data.frame(subset(rin_data,is.element(rin_data$blooddrawid,pheno_data_sub$blooddrawid)))
+rownames(rin_data_sub) = rin_data_sub$subjectId
+subs_notin_rin_data_sub = pheno_data_sub$subjectId[!is.element(pheno_data_sub$subjectId,
+                                                               rin_data_sub$subjectId)]
+new_rin_data_rows = data.frame(matrix(nrow=length(subs_notin_rin_data_sub), ncol=ncol(rin_data_sub)))
+rownames(new_rin_data_rows) = subs_notin_rin_data_sub
+colnames(new_rin_data_rows) = colnames(rin_data_sub)
+rin_data_sub = rbind(rin_data_sub, new_rin_data_rows)
+rin_data_sub = rin_data_sub[pheno_data_sub$subjectId,]
+
+# insert RIN, subgrp, and rfx_slope into pheno_data_sub
+pheno_data_sub$RIN = NA
+pheno_data_sub$subgrp = NA
+pheno_data_sub$rfx_slope = NA
+for (subjectId in pheno_data_sub$subjectId) {
+  rin2use = rin_data_sub[subjectId,"Final_RIN"]
+  pheno_data_sub[pheno_data_sub$subjectId==subjectId,"RIN"] = rin2use
+  
+  subgrp2use = as.character(tx_data[tx_data$subjectId==subjectId,"subgrp"])
+  pheno_data_sub[pheno_data_sub$subjectId==subjectId,"subgrp"] = subgrp2use
+  
+  slopes2use = tx_data[tx_data$subjectId==subjectId,"rfx_slope"]
+  pheno_data_sub[pheno_data_sub$subjectId==subjectId,"rfx_slope"] = slopes2use
+} # for (subjectId in pheno_data_sub$subjectId) {
+
+pheno_data_sub$subgrp = factor(pheno_data_sub$subgrp)
+
+# fill missing RIN with meanRIN
+meanRIN = mean(pheno_data_sub$RIN, na.rm=TRUE)
+na_rin_mask = is.na(pheno_data_sub$RIN)
+pheno_data_sub$RIN[na_rin_mask] = meanRIN 
+
+# re-order expression data columns to be the same order as the rows of pheno_data_sub
+exprData_sub = exprData[,as.character(pheno_data_sub$exprColName)]
+
+# write pheno data and expression data to csv files
+write.csv(pheno_data_sub, file = here("data","exprPhenoData_Microarray.csv"))
+write.csv(exprData_sub, file = here("data","exprData_Microarray.csv"))
+write.csv(meta_data, file = here("data","exprMetaData_Microarray.csv"))
+
+# subset tx_data to only those subjects with expression data
+tx_data_sub = subset(tx_data, is.element(tx_data$subjectId,pheno_data_sub$subjectId))
+rownames(tx_data_sub) = tx_data_sub$subjectId
+tx_data_sub$subjectId = factor(tx_data_sub$subjectId)
+tx_data_sub$subgrp = factor(tx_data_sub$subgrp)
+# rearrange ordering of rows to be same as ordering of 
+# rows and columns in pheno_data_sub and exprData_sub
+tx_data_sub = tx_data_sub[pheno_data_sub$subjectId,]
+# write out file of tx data for only subjects with expression data
+write.csv(tx_data_sub, file = here("data","tx_data_exprSubs_Microarray.csv"))
+
+unique_subs2use = unique(tx_data_sub$subjectId)
+melted_tx_data = subset(melted_tx_data, is.element(melted_tx_data$subjectId, unique_subs2use))
+```
+
+# Preprocess gene expression data
+
+Use variance filtering to remove genes with low expression variance.
+
+```{r, warning=FALSE, message=FALSE}
+# read in data
+exprPhenoData = read.csv(file = here("data","exprPhenoData_Microarray.csv"))
+exprData = read.csv(file = here("data","exprData_Microarray.csv"), row.names = 1)
+exprMetaData = read.csv(file = here("data","exprMetaData_Microarray.csv"))
+
+# =============================================================================
+# variance filter to grab top X% of genes with largest variance
+varianceFilterCutoff = 0.50
+filt_exprData = varFilter(as.matrix(exprData), var.cutoff = varianceFilterCutoff)
+# grab meta data for filtered gene set
+filt_meta_data = meta_data[rownames(filt_exprData),]
+
+# plot the unfiltered dataset
+x = melt(as.matrix(exprData))
+p = ggplot(data = x, aes(x = value, colour = Var2)) + geom_density() + guides(colour = FALSE)
+p
+
+# plot the resulting filtered dataset
+x = melt(filt_exprData)
+p = ggplot(data = x, aes(x = value, colour = Var2)) + geom_density() + guides(colour = FALSE)
+p
+
+# save adjusted expression data
+save(exprData,meta_data,exprPhenoData,filt_exprData,filt_meta_data, 
+     file = here("data","exprData_Microarray.Rdata"))
+```
+
+# Examine if treatment slopes are different as a function of batch, gex age, RIN, or sex 
+
+```{r, warning=FALSE, message=FALSE}
+mod2use = lm(formula = rfx_slope ~ batch + gex_age + RIN + sex, data = pheno_data_sub)
+anova(mod2use)
+```
+
+# Test if age at TX intake correlates with TX slopes 
+
+```{r, warning=FALSE, message=FALSE}
+tx_data_sub$TxStartSubgrp = "Before24Mo"
+tx_data_sub$TxStartSubgrp[tx_data_sub$age_tx_intake>=24] = "After24Mo"
+tx_data_sub$TxStartSubgrp = factor(tx_data_sub$TxStartSubgrp)
+
+# fontSize=20
+cols2use = colorRampPalette(c("blue","red"))(100)
+p1 = ggplot(data = tx_data_sub, aes(x = age_tx_intake, y = rfx_slope, colour = rfx_slope)) + 
+  geom_smooth(method=lm, colour = "black") + geom_point() + scale_color_gradientn(colors=cols2use, name="Treatment Slope") +
+  xlab("Age at Treatment Start") + ylab("Treatment Slope") + 
+  theme(axis.text.x = element_text(size=fontSize),
+        axis.text.y = element_text(size=fontSize),
+        axis.title.x = element_text(size=fontSize),
+        strip.text.x = element_text(size=fontSize),
+        axis.title.y = element_text(size=fontSize))
+ggsave(filename = here("plots","age_tx_intake_rfx_slope_correlation_plot_ALL.pdf"))
+p1
+
+cor.test(tx_data_sub$age_tx_intake, tx_data_sub$rfx_slope)
+```
+
+# Model age at treatment start or treatment start subgroups in LME
+
+```{r, warning=FALSE, message=FALSE}
+plotfname2save = file.path(txplotpath,"aSLP_EarlyLateSubgrp.pdf")
+data2use = data.frame(melted_tx_data)
+tx_data_sub$EarlyLateSubgrp = "Early"
+tx_data_sub$EarlyLateSubgrp[tx_data_sub$age_tx_intake>=24] = "Late"
+tx_data_sub$EarlyLateSubgrp = factor(tx_data_sub$EarlyLateSubgrp)
+early_subids2use = unique(tx_data_sub$subjectId[tx_data_sub$EarlyLateSubgrp=="Early"])
+late_subids2use = unique(tx_data_sub$subjectId[tx_data_sub$EarlyLateSubgrp=="Late"])
+melted_tx_data$EarlyLateSubgrp = "Early"
+melted_tx_data$EarlyLateSubgrp[is.element(melted_tx_data$subjectId,late_subids2use)] = "Late"
+melted_tx_data$EarlyLateSubgrp = factor(melted_tx_data$EarlyLateSubgrp)
+data2use = merge(melted_tx_data, tx_data_sub[,c("subjectId","days_in_tx")])
+
+# run statistical model
+y_var = "value"
+x_var = "age"
+subgrp_var = "EarlyLateSubgrp"
+fx_form = as.formula(sprintf("%s ~ days_in_tx + %s*%s", y_var, x_var, subgrp_var))
+rx_form = as.formula(sprintf("~ %s|subjectId",x_var))
+
+ctrl <- lmeControl(opt='optim', msMaxIter = 500)
+ml_method = "ML"
+mod2use = eval(substitute(lme(fixed = fx_form, random = rx_form, data = data2use, 
+                                 na.action = na.omit, control=ctrl, method = ml_method), 
+                             list(fx_form = fx_form, rx_form = rx_form)))
+anova(mod2use)
+
+# make the plot
+lm_res = spaghettiPlot(data2use,
+                       x_var = "age",
+                       y_var = "value",
+                       subgrp_var = "EarlyLateSubgrp",
+                       xLabel = "Age (months)",
+                       yLabel = "# of Mastered Targeted Skills (aSLP)",
+                       modelType = "linear",
+                       fname2save = plotfname2save,
+                       plot_dots = TRUE,
+                       plot_lines = TRUE,
+                       ci_band = TRUE,
+                       pi_band = FALSE,
+                       dot_alpha = 8/10,
+                       line_alpha = 8/10,
+                       band_alpha = 3/10,
+                       xLimits = c(10, 40),
+                       yLimits = c(-5,240))
+
+# fontSize = 20
+p = lm_res$p
+p = p + 
+  theme(axis.text.x = element_text(size=fontSize),
+        axis.text.y = element_text(size=fontSize),
+        axis.title.x = element_text(size=fontSize),
+        strip.text.x = element_text(size=fontSize),
+        axis.title.y = element_text(size=fontSize))
+ggsave(filename = plotfname2save, plot = p)
+p_early_late = p
+p
+
+# model standard deviation difference between Early vs Late start groups
+early_sd = sd(tx_data_sub$rfx_slope[tx_data_sub$EarlyLateSubgrp=="Early"])
+late_sd = sd(tx_data_sub$rfx_slope[tx_data_sub$EarlyLateSubgrp=="Late"])
+sd_diff = late_sd - early_sd
+print(sprintf("Early SD = %f",early_sd))
+print(sprintf("Late SD = %f",late_sd))
+print(sprintf("SD difference (Late - Early) = %f",sd_diff))
+
+# Run permutation test
+num_perm = 10000
+vars2use = c("num_perm","perm_early_sd","perm_late_sd","perm_sd_diff")
+perm_res = data.frame(matrix(nrow=num_perm, ncol=length(vars2use)))
+colnames(perm_res) = vars2use
+
+for (iperm in 1:num_perm){
+  set.seed(iperm)
+  tx_data_sub$perm_rfx_slope = sample(tx_data_sub$rfx_slope)
+  perm_res$perm_early_sd[iperm] = sd(tx_data_sub$perm_rfx_slope[tx_data_sub$EarlyLateSubgrp=="Early"])
+  perm_res$perm_late_sd[iperm] = sd(tx_data_sub$perm_rfx_slope[tx_data_sub$EarlyLateSubgrp=="Late"])
+  perm_res$perm_sd_diff[iperm] = perm_res$perm_late_sd[iperm] - perm_res$perm_early_sd[iperm]
+}
+
+# permutation p-value for whether actual standard deviation difference in real data is bigger than that in permuted data
+perm_sd_pval = (sum(perm_res$perm_sd_diff>=sd_diff)+1)/(num_perm+1)
+perm_sd_pval 
+
+# make histogram of permuted SD diff and plot actual SD diff as vertical red line
+p = ggplot(data = perm_res, aes(x = perm_sd_diff)) + geom_histogram(bins = 100) + geom_vline(xintercept = sd_diff, color="red") + 
+  xlab("Standard Deviation Difference (Late - Early)")+ ylab("Count")
+p = p + 
+  theme(axis.text.x = element_text(size=fontSize),
+        axis.text.y = element_text(size=fontSize),
+        axis.title.x = element_text(size=fontSize),
+        strip.text.x = element_text(size=fontSize),
+        axis.title.y = element_text(size=fontSize))
+ggsave(filename = here("plots","Early_vs_Late_SD_histogram.pdf"))
+p_sd_early_late = p
+p
+```
+
+# Run LASSO to predict subject-specific slopes with gene expression data
+
+```{r, warning=FALSE, message=FALSE}
+load(here("data","exprData_Microarray.Rdata"))
+dataType = "Microarray"
+
+USE_FILTERED_DATA = TRUE
+if (USE_FILTERED_DATA) {
+  data2use = t(filt_exprData)
+  metadata2use = filt_meta_data
+} else {
+  data2use = t(exprData)
+  metadata2use = meta_data
+} # if (USE_FILTERED_DATA) {
+dv2use = exprPhenoData[,"rfx_slope"] 
+
+ZSCORE_EXPRDATA = FALSE
+if (ZSCORE_EXPRDATA){
+  data2use = scale(data2use)
+}
+
+score.LOO.slope = .myLasso.LOO.new(inputData = t(data2use), 
+                                   inputTrait = exprPhenoData, 
+                                   dataType = dataType)
+
+# show what is the correlation between observed and predicted slopes from the LASSO model.
+cor(score.LOO.slope$data2plot)
+
+# print out mean squared error from this model
+score.LOO.slope$mse
+
+# Make the spaghetti plot 
+tx_data2plot = merge(melted_tx_data, exprPhenoData[,c("subjectId","rfx_slope")], by="subjectId")
+
+lm_res = spaghettiPlot(tx_data2plot, 
+                       x_var = "age", 
+                       y_var = "value", 
+                       subgrp_var = "subgrp", 
+                       xLabel = "Age (months)", 
+                       yLabel = "# of Mastered Targeted Skills (aSLP)", 
+                       modelType = "linear", 
+                       fname2save = NULL, 
+                       plot_dots = TRUE, 
+                       plot_lines = TRUE, 
+                       ci_band = FALSE, 
+                       pi_band = FALSE, 
+                       dot_alpha = 8/10, 
+                       line_alpha = 8/10,
+                       band_alpha = 3/10, 
+                       xLimits = c(10, 40), 
+                       yLimits = c(-5,240),
+                       lineColor = "rfx_slope",
+                       dotColor = "rfx_slope")
+single_sub_plot = lm_res$p
+
+# fontSize = 20
+long_plot = single_sub_plot
+long_plot = long_plot + 
+  theme(axis.text.x = element_text(size=fontSize),
+        axis.text.y = element_text(size=fontSize),
+        axis.title.x = element_text(size=fontSize),
+        strip.text.x = element_text(size=fontSize),
+        axis.title.y = element_text(size=fontSize))
+ggsave(filename = here("plots","aSLPtrajectories_rfx_slope_colored.pdf"), plot = long_plot)
+
+
+df2plot = data.frame(predSlope = score.LOO.slope$data2plot$predVal, 
+                     obsSlope = score.LOO.slope$data2plot$inputTrait, 
+                     subjectId = exprPhenoData$subjectId, 
+                     subgrp =exprPhenoData$subgrp)
+
+fontSize_tmp = 15
+cols2use = colorRampPalette(c("blue","red"))(100)
+p2 = ggplot(data = df2plot, aes(x = predSlope, y = obsSlope)) + 
+  geom_smooth(method=lm, col="black") + 
+  geom_point(aes(colour=obsSlope),size=2) + scale_color_gradientn(colors=cols2use, name = "Slope") +
+  xlab("Predicted Slope") + ylab("Actual Slope") + theme(legend.text=element_text(size=fontSize_tmp))+
+  theme(axis.text.x = element_text(size=fontSize_tmp),
+        axis.text.y = element_text(size=fontSize_tmp),
+        axis.title.x = element_text(size=fontSize_tmp),
+        strip.text.x = element_text(size=fontSize_tmp),
+        axis.title.y = element_text(size=fontSize_tmp))
+ggsave(filename = here("plots","gex_lasso_loo_plot2a.pdf"))
+
+p_final = single_sub_plot + p2 + plot_layout(nrow=1,ncol=2)
+ggsave(filename = here("plots","gex_lasso_loo_plot2b.pdf"))
+p_final
+#------------------------------------------------------------------------------
+
+# now lets find the genes that most highly contribute to the model
+score.LOO.slope.genesALL = .myLasso.LOO.genes.new(inputData = t(data2use),
+                                                  inputTrait = exprPhenoData,
+                                                  dataType = dataType)
+
+# find genes of importance
+# score.LOO.slope.genesALL = .myLasso.LOO.genes(inputData = data2use, inputTrait = dv2use)
+genesALL.keep.LOOslope = as.data.frame(table(unlist(score.LOO.slope.genesALL[1,])))
+genesALL.keep.LOOslope = genesALL.keep.LOOslope[with(genesALL.keep.LOOslope, order(-Freq)),]
+geneFilter = as.character(genesALL.keep.LOOslope[,1])
+good_genes = metadata2use[geneFilter,"geneSymbol"]
+res = data.frame(geneSymbol = good_genes, genesALL.keep.LOOslope)
+colnames(res)[2] = "ILMN_GENE"
+write.csv(res, file = here("results","res_lasso_loo_bestgenes_Microarray2.csv"))
+background_list = metadata2use$geneSymbol[is.element(metadata2use$PROBE_ID,colnames(data2use))]
+write(background_list, file = here("results","backgroundList_Microarray2.csv"))
+res
+
+# permutation test on MSE
+null_mse = .myRandFn.LOO.new(inputData = t(data2use),
+                             inputTrait = exprPhenoData,
+                             nperm = nperm,
+                             dataType = dataType,
+                             seed2use=123,
+                             verbose=FALSE)
+
+# make histogram plot of MSE null distribution
+df2plot = data.frame(mse = null_mse)
+p = ggplot(data = df2plot, aes(x = mse))
+p = p + geom_histogram() +
+  geom_vline(xintercept = score.LOO.slope$mse, colour="red") +
+  xlab("Mean Squared Error (MSE)")
+p
+
+# compute p-value
+p_val = sum(c(score.LOO.slope$mse,null_mse)<=score.LOO.slope$mse)/(nperm+1)
+p_val
+```
+
+# Make Figure 1
+
+```{r, warning=FALSE, message=FALSE}
+fontSize_fig1 = 10
+
+p1a = p_early_late+ ylab("aSLP")+
+  theme(axis.text.x = element_text(size=fontSize_fig1),
+        axis.text.y = element_text(size=fontSize_fig1),
+        axis.title.x = element_text(size=fontSize_fig1),
+        strip.text.x = element_text(size=fontSize_fig1),
+        axis.title.y = element_text(size=fontSize_fig1))
+p1b = long_plot+ ylab("aSLP")+theme(legend.text=element_text(size=fontSize_fig1))+
+  theme(axis.text.x = element_text(size=fontSize_fig1),
+        axis.text.y = element_text(size=fontSize_fig1),
+        axis.title.x = element_text(size=fontSize_fig1),
+        strip.text.x = element_text(size=fontSize_fig1),
+        axis.title.y = element_text(size=fontSize_fig1))
+p1c = p1+ scale_color_gradientn(colors = cols2use, name = "Slope")+theme(legend.text=element_text(size=fontSize_fig1))+
+  theme(axis.text.x = element_text(size=fontSize_fig1),
+        axis.text.y = element_text(size=fontSize_fig1),
+        axis.title.x = element_text(size=fontSize_fig1),
+        strip.text.x = element_text(size=fontSize_fig1),
+        axis.title.y = element_text(size=fontSize_fig1))
+p1d = p_sd_early_late+ 
+  theme(axis.text.x = element_text(size=fontSize_fig1),
+        axis.text.y = element_text(size=fontSize_fig1),
+        axis.title.x = element_text(size=fontSize_fig1),
+        strip.text.x = element_text(size=fontSize_fig1),
+        axis.title.y = element_text(size=fontSize_fig1))
+
+p_final = (p1a + p1c)/(p1b + p1d)
+ggsave(filename =  here("plots","fig1.pdf"), plot=p_final, width = 10, height = 5)
+```
+
+# Descriptive stats on demographic and basic clincial variables
+
+```{r, warning=FALSE, message=FALSE}
+# add in clinical data --------------------------------------------------------
+# read in lw_report
+lw_report = read.csv("/Users/mlombardo/Dropbox/ACE_pheno/data/LWReport_04182020_for_ML.csv",na.strings = "NULL")
+# subjects to look for in lw_report
+subids2lookfor = as.character(exprPhenoData$subjectId)
+# names of columns I'll look at in lw_report
+vine_vars = c("vine_agemo","vine_ComTotal_DomStd","vine_DlyTotal_DomStd","vine_SocTotal_DomStd","vine_MtrTotal_DomStd","vine_AdapBehav_DomStd")
+mull_vars = c("mullen_ageMo","mullen_VRT","mullen_FMT","mullen_RLT","mullen_ELT","mullen_ELC_Std")
+ados_vars = c("ados_ageMo","ados_CoSoTot","ados_RRTot","ados_CoSoTotRRTot")
+
+# number of timepoints
+n_tp = 5
+
+# tmp colnames that need the timepoint appended to the end
+vine_vars_tmp = vine_vars
+mull_vars_tmp = mull_vars
+ados_vars_tmp = ados_vars
+
+# pre-allocate clin_data df
+cols2use = c("subjectId", "age_tx_intake",
+             ados_vars[2:length(ados_vars)], 
+             mull_vars[2:length(mull_vars)], 
+             vine_vars[2:length(vine_vars)])
+clin_data = data.frame(matrix(nrow = length(subids2lookfor), ncol = length(cols2use)))
+colnames(clin_data) = cols2use
+rownames(clin_data) = subids2lookfor
+clin_data$subjectId = subids2lookfor
+
+for (isub in 1:length(subids2lookfor)){
+
+  # grab the row for the current subject
+  curr_sub = subids2lookfor[isub]
+  tmp_data = subset(lw_report, is.element(lw_report$subjectid,curr_sub))
+  
+  # find tx intage age
+  tx_age_intake = tx_data[is.element(tx_data$subjectId,curr_sub),"age_tx_intake"]
+  clin_data[curr_sub,"age_tx_intake"] = tx_age_intake
+  
+  for (i_tp in 1:n_tp){
+    
+    # get column time-point name
+    for (ivar in 1:length(vine_vars)){
+      vine_vars_tmp[ivar] = sprintf("%s_%d",vine_vars[ivar],i_tp)
+    } # for (ivar in 1:length(vine_vars)){
+    for (ivar in 1:length(mull_vars)){
+      mull_vars_tmp[ivar] = sprintf("%s_%d",mull_vars[ivar],i_tp)
+    } # for (ivar in 1:length(mull_vars)){
+    for (ivar in 1:length(ados_vars)){
+      ados_vars_tmp[ivar] = sprintf("%s_%d",ados_vars[ivar],i_tp)
+    } # for (ivar in 1:length(ados_vars)){
+    
+    # Check Vineland
+    data2check = tmp_data[,vine_vars_tmp]
+    age_tmp = floor(data2check[1])
+    if (dim(data2check)[1]!=0){
+      if ((age_tmp<=tx_age_intake) & !is.na(age_tmp)){
+        clin_data[curr_sub, vine_vars[2:length(vine_vars)]] =  data2check[2:length(data2check)]
+      } # if (tx_age_intake<=age_tmp){
+    } # if (dim(data2check)[1]!=0){
+
+    # Check Mullen
+    data2check = tmp_data[,mull_vars_tmp]
+    age_tmp = floor(data2check[1])
+    if (dim(data2check)[1]!=0){
+      if ((age_tmp<=(tx_age_intake+1)) & !is.na(age_tmp)){
+        clin_data[curr_sub, mull_vars[2:length(mull_vars)]] =  data2check[2:length(data2check)]
+      } # if (tx_age_intake<=age_tmp){
+    } # if (dim(data2check)[1]!=0){
+    
+    # Check ADOS
+    data2check = tmp_data[,ados_vars_tmp]
+    age_tmp = floor(data2check[1])
+    if (dim(data2check)[1]!=0){
+      if ((age_tmp<=tx_age_intake) & !is.na(age_tmp)){
+        clin_data[curr_sub, ados_vars[2:length(ados_vars)]] =  data2check[2:length(data2check)]
+      } # if (tx_age_intake<=age_tmp){
+    } # if (dim(data2check)[1]!=0){
+    
+  } # for (i_tp in 1:n_tp){
+  
+} # for (isub in 1:length(subids2lookfor)){
+
+clinvars2use = c(vine_vars[2:length(vine_vars)], mull_vars[2:length(mull_vars)], ados_vars[2:length(ados_vars)])
+clin_data2add = scale(clin_data[,3:ncol(clin_data)])
+data2use = cbind(data2use, clin_data2add[,clinvars2use])
+
+# clin_vars = colnames(clin_data2add)
+
+clin_vars = c("ados_CoSoTot","ados_RRTot","ados_CoSoTotRRTot","mullen_VRT","mullen_FMT","mullen_RLT","mullen_ELT","mullen_ELC_Std","vine_ComTotal_DomStd","vine_DlyTotal_DomStd","vine_SocTotal_DomStd","vine_MtrTotal_DomStd","vine_AdapBehav_DomStd")
+
+df2use = merge(clin_data[,c("subjectId",clin_vars)],lw_report[,c("subjectid","gender")], by.x = "subjectId",by.y = "subjectid")
+df2use = merge(df2use, tx_data_sub[,c("subjectId","age_tx_intake")], by = "subjectId")
+
+describeBy(df2use)
+
+table(df2use$gender)
+```
+
+# Spit out correlations between treatment slope and each clinical variable
+
+```{r, warning=FALSE, message=FALSE}
+clin_vars = c("ados_CoSoTot","ados_RRTot","ados_CoSoTotRRTot","mullen_VRT","mullen_FMT","mullen_RLT","mullen_ELT","vine_ComTotal_DomStd","vine_DlyTotal_DomStd","vine_SocTotal_DomStd","vine_MtrTotal_DomStd","vine_AdapBehav_DomStd")
+
+clin_var_names = c("ADOS SC", "ADOS RRB", "ADOS Total", 
+                   "MSEL VR", "MSEL FM", "MSEL RL", "MSEL EL",
+                   "VABS Comm","VABS DL","VABS Soc","VABS Motor","VABS ABC")
+cor_res = data.frame(matrix(nrow = length(clin_vars), ncol = length(c("ClinVar","r", "pval"))))
+colnames(cor_res) = c("ClinVar","r", "pval")
+rownames(cor_res) = clin_vars
+
+# print out the correlation of each clinical measure separately with treatment slope
+for (i in 1:length(clin_vars)){
+  tmp_res = cor.test(exprPhenoData$rfx_slope, clin_data2add[,clin_vars[i]])
+  cor_res[i,"ClinVar"] = clin_var_names[i]
+  cor_res[i,"r"] = tmp_res$estimate
+  cor_res[i,"pval"] = tmp_res$p.value
+} # for (i in 1:length(clin_vars)){
+cor_res$fdr_q = p.adjust(cor_res$pval, method = "fdr")
+cor_res
+
+cor_res$logp = -log10(cor_res$pval)
+# fontSize=15
+p = ggplot(data = cor_res, aes(x = ClinVar, y = r, fill = logp)) + 
+  geom_bar(stat = "identity", colour = "black") + xlab("Clinical Measure") + ylab("Pearson's r") +
+  geom_hline(yintercept = 0.31, linetype="dashed") +
+  geom_hline(yintercept = -0.31, linetype="dashed") +
+  ylim(-0.6,0.6) + 
+  scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100), name = "-log10(p)") +
+  coord_flip() +
+  theme(axis.text.x = element_text(size=fontSize),
+        axis.text.y = element_text(size=fontSize),
+        axis.title.x = element_text(size=fontSize),
+        strip.text.x = element_text(size=fontSize),
+        axis.title.y = element_text(size=fontSize))
+ggsave(filename = here("plots","clinmeasure_correlation_plot2.pdf"))
+clin_plot = p
+p
+```
+
+
+# Run LASSO to predict subject-specific slopes with ONLY pre-treatment clinical data 
+
+```{r, warning=FALSE, message=FALSE}
+cvfolds = 41
+clin_vars = c("ados_CoSoTot","ados_RRTot","ados_CoSoTotRRTot","mullen_VRT","mullen_FMT","mullen_RLT","mullen_ELT","vine_ComTotal_DomStd","vine_DlyTotal_DomStd","vine_SocTotal_DomStd","vine_MtrTotal_DomStd","vine_AdapBehav_DomStd")
+
+# now use the features within a LASSO
+data2use = scale(clin_data[, clin_vars])
+
+score.kCV.slope = .myLasso.CV.new.clin2(inputData = t(data2use), 
+                                  inputTrait = exprPhenoData,
+                                  cvfold = cvfolds,
+                                  dataType = dataType,
+                                  clin_vars = clin_vars)
+
+# correlation betwwen observed and predicted slopes
+cor(score.kCV.slope$data2plot)
+
+# print out mean squared error from this model
+score.kCV.slope$mse
+
+df2plot = data.frame(predSlope = score.kCV.slope$data2plot$predVal, 
+                     obsSlope = score.kCV.slope$data2plot$inputTrait, 
+                     subjectId = exprPhenoData$subjectId, 
+                     subgrp =exprPhenoData$subgrp)
+
+cols2use = colorRampPalette(c("blue","red"))(100)
+p2 = ggplot(data = df2plot, aes(x = predSlope, y = obsSlope)) + 
+  geom_smooth(method=lm, col="black") + 
+  geom_point(aes(colour=obsSlope),size=2) + scale_color_gradientn(colors=cols2use) +
+  xlab("Predicted Slope") + ylab("Actual Slope")+
+  theme(axis.text.x = element_text(size=fontSize),
+        axis.text.y = element_text(size=fontSize),
+        axis.title.x = element_text(size=fontSize),
+        strip.text.x = element_text(size=fontSize),
+        axis.title.y = element_text(size=fontSize))
+ggsave(filename = here("plots","clin_lasso_loo_plot2a.pdf"))
+
+p_final = single_sub_plot + p2 + plot_layout(nrow=1,ncol=2)
+ggsave(filename = here("plots","clin_lasso_loo_plot2b.pdf"))
+p_final
+
+# find the relevant clinical variables
+score.kCV.slope.clinALL = .myLasso.CV.genes.new.clin2(inputData = t(data2use),
+                                                 inputTrait = exprPhenoData,
+                                                 cvfold = cvfolds,
+                                                 dataType = dataType,
+                                                 clin_vars = clin_vars)
+
+clinALL.keep.kCVslope = as.data.frame(table(unlist(score.kCV.slope.clinALL[1,])))
+clinALL.keep.kCVslope = clinALL.keep.kCVslope[with(clinALL.keep.kCVslope, order(-Freq)),]
+clinFilter = as.character(clinALL.keep.kCVslope[,1])
+res = clinALL.keep.kCVslope
+colnames(res)[1] = "ClinVar"
+write.csv(res, file = here("results",sprintf("res_lasso_%dfold_bestclinvarsALL_Microarray2.csv",cvfolds)))
+res
+
+# permutation test on MSE
+null_mse = .myRandFn.CV.new.clin2(inputData = t(data2use),
+                            inputTrait = exprPhenoData,
+                            nperm = nperm,
+                            cvfold = cvfolds,
+                            dataType = dataType,
+                            seed2use=123,
+                            verbose=FALSE,
+                            clin_vars = clin_vars)
+
+# make histogram plot of MSE null distribution
+df2plot = data.frame(mse = null_mse)
+p = ggplot(data = df2plot, aes(x = mse))  
+p = p + geom_histogram() + 
+  geom_vline(xintercept = score.kCV.slope$mse, colour="red") +
+  xlab("Mean Squared Error (MSE)")
+p  
+
+# compute p-value
+p_val = sum(c(score.kCV.slope$mse,null_mse)<=score.kCV.slope$mse)/(nperm+1)
+p_val
+```
+
+# Make Figure 2
+
+```{r, warning=FALSE, message=FALSE}
+fontSize_fig2 = 10
+
+p2a = p2+ scale_color_gradientn(colors = cols2use, name = "Slope") + theme(legend.text=element_text(size=fontSize_fig2))+
+  theme(axis.text.x = element_text(size=fontSize_fig2),
+        axis.text.y = element_text(size=fontSize_fig2),
+        axis.title.x = element_text(size=fontSize_fig2),
+        strip.text.x = element_text(size=fontSize_fig2),
+        axis.title.y = element_text(size=fontSize_fig2))
+p2b = clin_plot+ theme(legend.text=element_text(size=fontSize_fig2))+
+  theme(axis.text.x = element_text(size=fontSize_fig2),
+        axis.text.y = element_text(size=fontSize_fig2),
+        axis.title.x = element_text(size=fontSize_fig2),
+        strip.text.x = element_text(size=fontSize_fig2),
+        axis.title.y = element_text(size=fontSize_fig2))
+
+p_final = (p2a + p2b)
+ggsave(filename =  here("plots","fig2.pdf"), plot=p_final, width = 10, height = 5)
+```

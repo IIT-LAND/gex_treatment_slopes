@@ -16,7 +16,9 @@ easypackages::libraries("readxl","ggplot2","patchwork",
                         "genefilter","Biobase","psych","nlme")
 source(here("code","lasso_functions.R"))
 source(here("code","spaghettiPlot.R"))
+source(here("code","genelistOverlap.R"))
 source("/Users/mlombardo/Dropbox/R/get_ggColorHue.R")
+load(here("data","enrichment_data_new.Rdata"))
 
 # number of permutations to set for all the permutation tests run down below
 nperm = 1000
@@ -179,16 +181,6 @@ varianceFilterCutoff = 0.50
 filt_exprData = varFilter(as.matrix(exprData), var.cutoff = varianceFilterCutoff)
 # grab meta data for filtered gene set
 filt_meta_data = meta_data[rownames(filt_exprData),]
-
-# plot the unfiltered dataset
-x = melt(as.matrix(exprData))
-p = ggplot(data = x, aes(x = value, colour = Var2)) + geom_density() + guides(colour = FALSE)
-p
-
-# plot the resulting filtered dataset
-x = melt(filt_exprData)
-p = ggplot(data = x, aes(x = value, colour = Var2)) + geom_density() + guides(colour = FALSE)
-p
 
 # save adjusted expression data
 save(exprData,meta_data,exprPhenoData,filt_exprData,filt_meta_data, 
@@ -427,9 +419,9 @@ geneFilter = as.character(genesALL.keep.LOOslope[,1])
 good_genes = metadata2use[geneFilter,"geneSymbol"]
 res = data.frame(geneSymbol = good_genes, genesALL.keep.LOOslope)
 colnames(res)[2] = "ILMN_GENE"
-write.csv(res, file = here("results","res_lasso_loo_bestgenes_Microarray2.csv"))
+write.csv(res, file = here("results","res_lasso_loo_bestgenes_Microarray.csv"))
 background_list = metadata2use$geneSymbol[is.element(metadata2use$PROBE_ID,colnames(data2use))]
-write(background_list, file = here("results","backgroundList_Microarray2.csv"))
+write(background_list, file = here("results","backgroundList_Microarray.csv"))
 res
 
 # permutation test on MSE
@@ -485,6 +477,7 @@ p1d = p_sd_early_late+
 
 p_final = (p1a + p1c)/(p1b + p1d)
 ggsave(filename =  here("plots","fig1.pdf"), plot=p_final, width = 10, height = 5)
+p_final
 ```
 
 # Descriptive stats on demographic and basic clincial variables
@@ -624,7 +617,7 @@ p = ggplot(data = cor_res, aes(x = ClinVar, y = r, fill = logp)) +
         axis.title.x = element_text(size=fontSize),
         strip.text.x = element_text(size=fontSize),
         axis.title.y = element_text(size=fontSize))
-ggsave(filename = here("plots","clinmeasure_correlation_plot2.pdf"))
+ggsave(filename = here("plots","clinmeasure_correlation_plot.pdf"))
 clin_plot = p
 p
 ```
@@ -684,7 +677,7 @@ clinALL.keep.kCVslope = clinALL.keep.kCVslope[with(clinALL.keep.kCVslope, order(
 clinFilter = as.character(clinALL.keep.kCVslope[,1])
 res = clinALL.keep.kCVslope
 colnames(res)[1] = "ClinVar"
-write.csv(res, file = here("results",sprintf("res_lasso_%dfold_bestclinvarsALL_Microarray2.csv",cvfolds)))
+write.csv(res, file = here("results",sprintf("res_lasso_%dfold_bestclinvarsALL_Microarray.csv",cvfolds)))
 res
 
 # permutation test on MSE
@@ -730,4 +723,102 @@ p2b = clin_plot+ theme(legend.text=element_text(size=fontSize_fig2))+
 
 p_final = (p2a + p2b)
 ggsave(filename =  here("plots","fig2.pdf"), plot=p_final, width = 10, height = 5)
+p_final
 ```
+
+# Enrichment analyses
+
+```{r, warning=FALSE, message=FALSE}
+# load tx_relevant genes
+loo_genes = read.csv(here("results","res_lasso_loo_bestgenes_Microarray.csv"))
+
+# get background gene list
+load(here("data","exprData_Microarray.Rdata"))
+backgroundTotal = dim(filt_meta_data)[1]
+bglist = unique(filt_meta_data$geneSymbol)
+bglist[bglist=="MLL3"] = "KMT2C"
+
+# set up lists for analysis
+geneclasses = list(SFARIASD,
+                   gandal_asd_down,
+                   gandal_asd_up,
+                   pfc_down,
+                   pfc_up,
+                   tc_down,
+                   tc_up)
+
+geneclassnames = c("SFARI ASD",
+                   "ASD DE Downreg",
+                   "ASD DE Upreg",
+                   "ASD DA PFC up",
+                   "ASD DA PFC down",
+                   "ASD DA TC up",
+                   "ASD DA TC down")
+
+# pre-allocate data frames to store results
+res_colnames =  c("loo_genes")
+ORmat = data.frame(matrix(nrow = length(geneclasses), 
+                          ncol = length(res_colnames)))
+logPmat = data.frame(matrix(nrow = length(geneclasses), 
+                            ncol = length(res_colnames)))
+Pmat = data.frame(matrix(nrow = length(geneclasses), 
+                         ncol = length(res_colnames)))
+FDRmat = data.frame(matrix(nrow = length(geneclasses), 
+                           ncol = length(res_colnames)))
+colnames(ORmat) = res_colnames
+colnames(logPmat) = res_colnames
+colnames(Pmat) = res_colnames
+colnames(FDRmat) = res_colnames
+rownames(ORmat) = geneclassnames
+rownames(logPmat) = geneclassnames
+rownames(Pmat) = geneclassnames
+rownames(FDRmat) = geneclassnames
+
+# loop over gene lists
+for (i in 1:length(geneclasses)){
+  # intersect with background list
+  genes2 = geneclasses[[i]]
+  mask = is.element(genes2,bglist)
+  genes2 = data.frame(genes2[mask])
+  
+  overlap_res = genelistOverlap(as.character(unique(loo_genes$geneSymbol)),
+                                genes2,
+                                backgroundTotal,
+                                print_result = FALSE,
+                                header = FALSE)
+  ORmat[i,"loo_genes"] = overlap_res[[1]]$OR
+  logPmat[i,"loo_genes"] = -log10(overlap_res[[1]]$hypergeo_p)
+  Pmat[i,"loo_genes"] = overlap_res[[1]]$hypergeo_p
+  
+  if (is.element(geneclassnames[i],c("ASD DA TC down","ASD DA PFC up","SFARI ASD"))){
+    print(geneclassnames[i])
+    print(sort(overlap_res[[1]]$overlapping_genes))
+  } #if (geneclassnames[i],c("ASD DA TC down","ASD DA PFC up"){
+  
+}
+
+# compute FDR
+for (i in 1:dim(Pmat)[2]){
+  FDRmat[,i] = p.adjust(Pmat[,i], method = "fdr")
+}
+
+enrichment_results = data.frame(genelist = geneclassnames, OR = ORmat, pval = Pmat, log_p = -log10(Pmat),fdr_q = FDRmat)
+colnames(enrichment_results) = c("genelist","OR","pval","log_p","fdr_q")
+enrichment_results
+
+
+fontSize = 15
+p = ggplot(data = enrichment_results, aes(x = genelist, y = log_p, fill = OR)) + 
+  geom_bar(stat="identity", colour = "black") + xlab(" ") + ylab("-log10(p)") + 
+  geom_hline(yintercept = -log10(0.025), linetype="dashed") +
+  scale_fill_gradientn(colors = colorRampPalette(c("white","red"))(100)) +
+  coord_flip() +
+  theme(axis.text.x = element_text(size=fontSize),
+        axis.text.y = element_text(size=fontSize),
+        axis.title.x = element_text(size=fontSize),
+        strip.text.x = element_text(size=fontSize))
+ggsave(filename = here("plots","asd_enrichment_plot.pdf"))
+p
+```
+
+
